@@ -32,13 +32,15 @@ jobs:
       run: |
         pyinstaller --noconsole --onefile --add-data "secret.key;." main.py
 
-    # 5. بناء ملف الـ Setup باستخدام Inno Setup Action
-    - name: Compile Inno Setup Installer
-      uses: sbpack/inno-setup-action@v2
-      with:
-        filepath: 'installer.iss'
+    # 5. تثبيت Inno Setup وتجميعه (التعديل هنا 🎯)
+    - name: Install Inno Setup
+      uses: ammarcharani/setup-inno-setup@v2
 
-    # 6. رفع الملف النهائي للتنزل
+    - name: Compile Inno Setup Script
+      run: |
+        iscc installer.iss
+
+    # 6. رفع الملف النهائي للتنزيل
     - name: Upload Installer Artifact
       uses: actions/upload-artifact@v4
       with:
