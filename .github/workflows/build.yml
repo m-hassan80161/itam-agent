@@ -32,15 +32,18 @@ jobs:
       run: |
         pyinstaller --noconsole --onefile --add-data "secret.key;." main.py
 
-    # 5. تثبيت Inno Setup وتجميعه (التعديل هنا 🎯)
-    - name: Install Inno Setup
-      uses: ammarcharani/setup-inno-setup@v2
+    # 5. تثبيت Inno Setup عبر Chocolatey وإضافته للمسار (طريقة رسمية وآمنة 🎯)
+    - name: Install Inno Setup via Chocolatey
+      run: |
+        choco install innosetup -y
+        echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
 
+    # 6. تجميع ملف installer.iss باستخدام ISCC مباشرة
     - name: Compile Inno Setup Script
       run: |
-        iscc installer.iss
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
-    # 6. رفع الملف النهائي للتنزيل
+    # 7. رفع الملف النهائي للتنزيل
     - name: Upload Installer Artifact
       uses: actions/upload-artifact@v4
       with:
