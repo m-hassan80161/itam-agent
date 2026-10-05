@@ -1,16 +1,65 @@
 import os
 import sys
 import json
+import getpass
+import logging
+import logging.handlers
+import shutil
 import socket
 import platform
 import psutil
 import requests
 import hashlib
+import subprocess
+import tempfile
+from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 from cryptography.fernet import Fernet
 import pystray
 from PIL import Image, ImageDraw
+
+logger = logging.getLogger("itam_agent")
+
+
+def configure_logging():
+    if os.name == "nt":
+        app_data = os.environ.get("LOCALAPPDATA")
+        log_directories = (
+            [Path(app_data) / "ITAM Agent"] if app_data else []
+        ) + [Path(tempfile.gettempdir()) / "ITAM Agent"]
+    else:
+        log_directories = [
+            Path.home() / ".local" / "state" / "itam-agent",
+            Path(tempfile.gettempdir()) / "itam-agent",
+        ]
+
+    log_errors = []
+    for directory in log_directories:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                directory / "itam-agent.log",
+                maxBytes=1_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            break
+        except OSError as exc:
+            log_errors.append(f"{directory}: {exc}")
+            continue
+    else:
+        handler = logging.StreamHandler()
+
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s"
+    ))
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    for error in log_errors:
+        logger.error("Could not create a log file in %s.", error)
+    logger.info("ITAM Agent started. Log file: %s", getattr(handler, "baseFilename", "stderr"))
+
 
 # ----------------------------------------------------
 # 1. إدارة التشفير والإعدادات
@@ -35,7 +84,7 @@ def load_config():
             decrypted = cipher.decrypt(f.read())
         return json.loads(decrypted.decode('utf-8'))
     except Exception as e:
-        print(f"Error loading config: {e}")
+        logger.exception("Could not load encrypted configuration: %s", e)
         return None
 
 def save_config(config_data):
@@ -48,7 +97,7 @@ def save_config(config_data):
             f.write(encrypted)
         return True
     except Exception as e:
-        print(f"Error saving config: {e}")
+        logger.exception("Could not save encrypted configuration: %s", e)
         return False
 
 # ----------------------------------------------------
@@ -58,37 +107,310 @@ def save_config(config_data):
 def collect_inventory():
     payload = {
         "computerName": socket.gethostname(),
+        "loggedInUser": getpass.getuser(),
         "osName": platform.system(),
         "osVersion": platform.version(),
-        "cpuModel": platform.processor(),
-        "cpuCores": psutil.cpu_count(logical=False),
-        "cpuThreads": psutil.cpu_count(logical=True),
-        "ramTotalGb": round(psutil.virtual_memory().total / (1024**3), 2),
-        "disks": []
+        "osBuild": platform.version(),
+        "domain": None,
+        "cpu": {
+            "model": platform.processor() or "Unknown",
+            "cores": psutil.cpu_count(logical=False) or 0,
+            "threads": psutil.cpu_count(logical=True) or 0,
+            "clockSpeedMhz": 0,
+            "architecture": platform.machine() or "Unknown",
+        },
+        "motherboard": {
+            "manufacturer": "Unknown",
+            "model": "Unknown",
+            "serialNumber": None,
+        },
+        "ramModules": [],
+        "disks": [],
+        "software": [],
+        "gitConfig": None,
     }
+
+    if os.name == "nt":
+        try:
+            payload.update(_collect_windows_hardware())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            logger.exception("Could not collect detailed Windows hardware information.")
+        payload["software"] = _collect_installed_software()
+
+    if not payload["disks"]:
+        payload["disks"] = _collect_logical_disks()
+    payload["gitConfig"] = _collect_git_config()
+    logger.info(
+        "Inventory collected: %d RAM modules, %d disks, %d software entries.",
+        len(payload["ramModules"]),
+        len(payload["disks"]),
+        len(payload["software"]),
+    )
+    return payload
+
+
+def _collect_logical_disks():
+    disks = []
     for partition in psutil.disk_partitions():
         try:
             usage = psutil.disk_usage(partition.mountpoint)
-            payload["disks"].append({
-                "device": partition.device,
-                "totalGb": round(usage.total / (1024**3), 2),
-                "freeGb": round(usage.free / (1024**3), 2)
-            })
-        except PermissionError:
+        except (PermissionError, OSError) as exc:
+            logger.warning(
+                "Could not read disk usage for %s: %s",
+                partition.mountpoint,
+                exc,
+            )
             continue
-    return payload
+        disks.append({
+            "drive": partition.mountpoint,
+            "volumeName": partition.device or None,
+            "totalSpaceGb": round(usage.total / (1024 ** 3), 2),
+            "freeSpaceGb": round(usage.free / (1024 ** 3), 2),
+        })
+    return disks
+
+
+def _run_powershell_json(script):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        raise FileNotFoundError("PowerShell is not available.")
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def _collect_windows_hardware():
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$computer = Get-CimInstance Win32_ComputerSystem
+$os = Get-CimInstance Win32_OperatingSystem
+$processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+$board = Get-CimInstance Win32_BaseBoard | Select-Object -First 1
+$architectureMap = @{ 0='x86'; 1='MIPS'; 2='Alpha'; 3='PowerPC'; 5='ARM'; 6='ia64'; 9='x64' }
+$architecture = if ($architectureMap.ContainsKey([int]$processor.Architecture)) {
+    $architectureMap[[int]$processor.Architecture]
+} else { 'Unknown' }
+$ram = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+    @{
+        capacityGb = [int][math]::Round(([double]$_.Capacity / 1GB), 0)
+        speedMhz = [int]$_.Speed
+        serialNumber = if ($_.SerialNumber) { $_.SerialNumber.ToString().Trim() } else { $null }
+        slot = if ($_.BankLabel) { $_.BankLabel.ToString().Trim() } else { $null }
+    }
+})
+$volumes = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object DriveLetter)
+$logicalDisks = @($volumes | ForEach-Object {
+    @{
+        drive = "$($_.DriveLetter):"
+        volumeName = if ($_.FileSystemLabel) { $_.FileSystemLabel } else { $null }
+        totalSpaceGb = [math]::Round(([double]$_.Size / 1GB), 2)
+        freeSpaceGb = [math]::Round(([double]$_.SizeRemaining / 1GB), 2)
+    }
+})
+$physicalDisks = @(Get-Disk -ErrorAction SilentlyContinue | ForEach-Object {
+    $disk = $_
+    $model = if ($disk.FriendlyName) { $disk.FriendlyName.ToString().Trim() } else { 'Unknown' }
+    $type = if ($model -match 'NVMe') { 'NVME' } elseif ($model -match 'SSD') { 'SSD' } else { 'HDD' }
+    $freeBytes = [double]0
+    $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)
+    foreach ($partition in $partitions) {
+        if ($partition.DriveLetter) {
+            $volume = Get-Volume -DriveLetter $partition.DriveLetter -ErrorAction SilentlyContinue
+            if ($volume) { $freeBytes += [double]$volume.SizeRemaining }
+        }
+    }
+    @{
+        type = $type
+        model = $model
+        serialNumber = if ($disk.SerialNumber) { $disk.SerialNumber.ToString().Trim() } else { $null }
+        totalSpaceGb = [math]::Round(([double]$disk.Size / 1GB), 2)
+        freeSpaceGb = [math]::Round(($freeBytes / 1GB), 2)
+    }
+})
+$domain = if ($computer.PartOfDomain) { $computer.Domain } else { $null }
+[ordered]@{
+    computerName = $computer.Name
+    loggedInUser = if ($computer.UserName) { $computer.UserName } else { $env:USERNAME }
+    osName = $os.Caption
+    osVersion = $os.Version
+    osBuild = $os.BuildNumber
+    domain = $domain
+    cpu = @{
+        model = if ($processor.Name) { $processor.Name.ToString().Trim() } else { 'Unknown' }
+        cores = [int]$processor.NumberOfCores
+        threads = [int]$processor.NumberOfLogicalProcessors
+        clockSpeedMhz = [int]$processor.MaxClockSpeed
+        architecture = $architecture
+    }
+    motherboard = @{
+        manufacturer = if ($board.Manufacturer) { $board.Manufacturer.ToString().Trim() } else { 'Unknown' }
+        model = if ($board.Product) { $board.Product.ToString().Trim() } else { 'Unknown' }
+        serialNumber = if ($board.SerialNumber) { $board.SerialNumber.ToString().Trim() } else { $null }
+    }
+    ramModules = $ram
+    disks = $physicalDisks
+    logicalDisks = $logicalDisks
+} | ConvertTo-Json -Depth 8 -Compress
+"""
+    hardware = _run_powershell_json(script)
+    logical_disks = hardware.pop("logicalDisks", [])
+    hardware["disks"] = hardware.get("disks") or logical_disks
+    return hardware
+
+
+def _collect_installed_software():
+    if os.name != "nt":
+        return []
+
+    import winreg
+
+    software = {}
+    uninstall_paths = (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    )
+    for hive, path in uninstall_paths:
+        try:
+            with winreg.OpenKey(hive, path) as root:
+                subkey_count = winreg.QueryInfoKey(root)[0]
+                for index in range(subkey_count):
+                    try:
+                        subkey_name = winreg.EnumKey(root, index)
+                        with winreg.OpenKey(root, subkey_name) as app_key:
+                            name = _read_registry_value(winreg, app_key, "DisplayName")
+                            if not name:
+                                continue
+                            software[name.casefold()] = {
+                                "name": name,
+                                "version": _read_registry_value(
+                                    winreg, app_key, "DisplayVersion"
+                                ) or "Unknown",
+                                "publisher": _read_registry_value(
+                                    winreg, app_key, "Publisher"
+                                ),
+                                "installDate": _read_registry_value(
+                                    winreg, app_key, "InstallDate"
+                                ),
+                            }
+                    except OSError as exc:
+                        logger.warning("Could not read an installed-app registry entry: %s", exc)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Could not read installed-app registry path %s: %s", path, exc)
+    return sorted(software.values(), key=lambda app: app["name"].casefold())
+
+
+def _read_registry_value(winreg, key, name):
+    try:
+        value, _ = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _collect_git_config():
+    git = shutil.which("git")
+    if not git:
+        logger.info("Git is not installed; skipping Git inventory.")
+        return None
+
+    def read_git_value(key):
+        try:
+            result = subprocess.run(
+                [git, "config", "--global", key],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not read Git setting %s: %s", key, exc)
+            return None
+        value = result.stdout.strip()
+        return value or None
+
+    try:
+        version_result = subprocess.run(
+            [git, "--version"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+        )
+        git_version = version_result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Could not read Git version: %s", exc)
+        git_version = None
+
+    ssh_dir = Path.home() / ".ssh"
+    try:
+        public_keys = sorted(
+            path.stem for path in ssh_dir.glob("*.pub") if path.is_file()
+        )
+    except OSError as exc:
+        logger.warning("Could not list SSH public-key filenames: %s", exc)
+        public_keys = []
+
+    return {
+        "userName": read_git_value("user.name"),
+        "userEmail": read_git_value("user.email"),
+        "gitVersion": git_version,
+        "sshPublicKeys": public_keys,
+    }
+
 
 def send_inventory():
     config = load_config()
     if not config:
+        logger.error("Inventory was not sent because configuration could not be loaded.")
         return False
-    url = f"http://{config['server_ip']}:{config['server_port']}{config['endpoint']}"
+
     try:
-        response = requests.post(url, json=collect_inventory(), timeout=10)
-        return response.status_code in [200, 201]
-    except Exception as e:
-        print(f"Failed to send data: {e}")
+        url = f"http://{config['server_ip']}:{config['server_port']}{config['endpoint']}"
+    except (KeyError, TypeError, ValueError):
+        logger.exception("Invalid API configuration; inventory was not uploaded.")
         return False
+
+    try:
+        inventory = collect_inventory()
+    except Exception:
+        logger.exception("Could not collect inventory; upload was skipped.")
+        return False
+
+    logger.info("Uploading inventory to %s.", url)
+    try:
+        response = requests.post(
+            url,
+            json=inventory,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "ITAM-Inventory-Agent/1.0",
+            },
+            timeout=30,
+        )
+    except requests.exceptions.RequestException:
+        logger.exception("Network error while uploading inventory.")
+        return False
+
+    logger.info("API response: HTTP %s %s", response.status_code, response.reason)
+    if response.text:
+        logger.info("API response body: %s", response.text[:4000])
+    if 200 <= response.status_code < 300:
+        logger.info("Inventory uploaded successfully.")
+        return True
+    logger.error("Inventory upload failed with HTTP %s.", response.status_code)
+    return False
 
 # ----------------------------------------------------
 # 3. واجهة الإعدادات المحمية بكلمة سر
@@ -158,8 +480,17 @@ def create_tray_icon():
     return image
 
 def main():
+    configure_logging()
+
     def on_sync(icon, item):
-        send_inventory()
+        if send_inventory():
+            notification = "Inventory uploaded successfully."
+        else:
+            notification = "Upload failed. Check the ITAM Agent log."
+        try:
+            icon.notify(notification, "ITAM Agent")
+        except (NotImplementedError, OSError):
+            logger.exception("Could not display the sync notification.")
 
     def on_settings(icon, item):
         open_settings()
