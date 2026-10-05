@@ -1,0 +1,46 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    # 1. سحب الكود من المستودع
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    # 2. إعداد Python 3.10
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    # 3. تثبيت المكتبات
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 4. بناء ملف .exe وتضمين مفتاح secret.key بداخله
+    - name: Build Executable with PyInstaller
+      run: |
+        pyinstaller --noconsole --onefile --add-data "secret.key;." main.py
+
+    # 5. بناء ملف الـ Setup باستخدام Inno Setup Action
+    - name: Compile Inno Setup Installer
+      uses: sbpack/inno-setup-action@v2
+      with:
+        filepath: 'installer.iss'
+
+    # 6. رفع الملف النهائي للتنزل
+    - name: Upload Installer Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ITAM-Agent-Installer
+        path: Output/*.exe

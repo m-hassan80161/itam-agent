@@ -1,0 +1,6 @@
+cryptography
+pystray
+pillow
+psutil
+requests
+pyinstaller
