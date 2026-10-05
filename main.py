@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import ctypes
+from ctypes import wintypes
 import getpass
 import logging
 import logging.handlers
@@ -20,6 +22,32 @@ import pystray
 from PIL import Image, ImageDraw
 
 logger = logging.getLogger("itam_agent")
+_instance_mutex = None
+
+
+def acquire_single_instance():
+    global _instance_mutex
+    if os.name != "nt":
+        return True
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\ITAM_Agent")
+    if not _instance_mutex:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:
+        kernel32.CloseHandle(_instance_mutex)
+        _instance_mutex = None
+        return False
+    return True
 
 
 def configure_logging():
@@ -76,11 +104,20 @@ def get_secret_key():
     with open(key_path, "rb") as key_file:
         return key_file.read()
 
+
+def get_config_path():
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        program_data = os.environ.get("PROGRAMDATA")
+        if program_data:
+            return Path(program_data) / "ITAM Agent" / "config.enc"
+    return Path(__file__).resolve().parent / "config.enc"
+
+
 def load_config():
     try:
         key = get_secret_key()
         cipher = Fernet(key)
-        with open("config.enc", "rb") as f:
+        with get_config_path().open("rb") as f:
             decrypted = cipher.decrypt(f.read())
         return json.loads(decrypted.decode('utf-8'))
     except Exception as e:
@@ -93,7 +130,9 @@ def save_config(config_data):
         cipher = Fernet(key)
         json_bytes = json.dumps(config_data).encode('utf-8')
         encrypted = cipher.encrypt(json_bytes)
-        with open("config.enc", "wb") as f:
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with config_path.open("wb") as f:
             f.write(encrypted)
         return True
     except Exception as e:
@@ -185,6 +224,13 @@ def _run_powershell_json(script):
 
 
 def _collect_windows_hardware():
+    if platform.release() == "7":
+        logger.info(
+            "Windows 7 detected; using built-in inventory fallbacks for "
+            "hardware that requires newer PowerShell storage cmdlets."
+        )
+        return _collect_windows_7_fallback()
+
     script = r"""
 $ErrorActionPreference = 'Stop'
 $computer = Get-CimInstance Win32_ComputerSystem
@@ -261,6 +307,36 @@ $domain = if ($computer.PartOfDomain) { $computer.Domain } else { $null }
     logical_disks = hardware.pop("logicalDisks", [])
     hardware["disks"] = hardware.get("disks") or logical_disks
     return hardware
+
+
+def _collect_windows_7_fallback():
+    import winreg
+
+    cpu_model = "Unknown"
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        ) as cpu_key:
+            cpu_model = str(winreg.QueryValueEx(cpu_key, "ProcessorNameString")[0]).strip()
+    except OSError as exc:
+        logger.warning("Could not read the Windows 7 CPU model from the registry: %s", exc)
+
+    domain = os.environ.get("USERDOMAIN")
+    if domain and domain.casefold() == socket.gethostname().casefold():
+        domain = None
+
+    return {
+        "cpu": {
+            "model": cpu_model or "Unknown",
+            "cores": psutil.cpu_count(logical=False) or 0,
+            "threads": psutil.cpu_count(logical=True) or 0,
+            "clockSpeedMhz": 0,
+            "architecture": platform.machine() or "Unknown",
+        },
+        "domain": domain,
+        "disks": _collect_logical_disks(),
+    }
 
 
 def _collect_installed_software():
@@ -481,6 +557,13 @@ def create_tray_icon():
 
 def main():
     configure_logging()
+    try:
+        if not acquire_single_instance():
+            logger.info("Another ITAM Agent instance is already running.")
+            return
+    except OSError:
+        logger.exception("Could not establish the single-instance guard.")
+        return
 
     def on_sync(icon, item):
         if send_inventory():

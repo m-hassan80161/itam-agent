@@ -11,16 +11,19 @@ OutputDir=Output
 
 [Files]
 ; الملف التنفيذي الناتج من PyInstaller
-Source: "dist\main.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\ITAMAgent.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; ملف الإعدادات المشفر
-Source: "config.enc"; DestDir: "{app}"; Flags: ignoreversion
+Source: "config.enc"; DestDir: "{commonappdata}\ITAM Agent"; Flags: onlyifdoesntexist; Permissions: users-modify
+
+[Dirs]
+Name: "{commonappdata}\ITAM Agent"; Permissions: users-modify
 
 [Icons]
-Name: "{group}\ITAM Agent"; Filename: "{app}\main.exe"
+Name: "{group}\ITAM Agent"; Filename: "{app}\ITAMAgent.exe"
 
 [Registry]
-; جعل البرنامج يعمّل تلقائياً مع إقلاع نظام ويندوز
-Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ITAMAgent"; ValueData: """{app}\main.exe"""; Flags: uninsdeletevalue
+; تشغيل الوكيل بالخلفية عند تسجيل الدخول بعد إقلاع ويندوز
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ITAMAgent"; ValueData: """{app}\ITAMAgent.exe"""; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\main.exe"; Description: "Launch ITAM Agent"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\ITAMAgent.exe"; Description: "Launch ITAM Agent"; Flags: nowait postinstall skipifsilent
